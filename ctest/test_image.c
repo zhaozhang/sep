@@ -221,10 +221,10 @@ void print_time(char *s, uint64_t tdiff)
 
 int main(int argc, char **argv)
 {
-  char *fname1, *fname2, *fname3;
+  char *fname1, *fname2;
   int i, status, nx, ny;
-  double *flux, *fluxerr, *fluxt, *fluxerrt, *area, *areat;
-  short *flag, *flagt;
+  double *flux, *fluxerr, *fluxt, *fluxerrt, *area, *areat, *eflux, *efluxerr, *earea, *kronrad, *kronradt;
+  short *flag, *flagt, *eflag, *kflag;
   float *im, *imback;
   uint64_t t0, t1;
   sepbackmap *bkmap = NULL;
@@ -236,16 +236,20 @@ int main(int argc, char **argv)
   status = 0;
   flux = fluxerr = NULL;
   flag = NULL;
+  eflux = efluxerr = NULL;
+  eflag = NULL;
+  kronrad = NULL;
+  kflag = NULL;
 
   /* Parse command-line arguments */
-  if (argc != 4)
+  if (argc != 3)
     {
-      printf("Usage: runtests IMAGE_NAME CATALOG_NAME BACKGROUND_NAME\n");
+      printf("Usage: runtests IMAGE_NAME CATALOG_NAME\n");
       exit(1);
     }
   fname1 = argv[1];
   fname2 = argv[2];
-  fname3 = argv[3];
+  //fname3 = argv[3];
 
   /* read in image */
   im = read_image_flt(fname1, &nx, &ny);
@@ -272,7 +276,7 @@ int main(int argc, char **argv)
   print_time("sep_backarray()", t1-t0);
   
   /* write out back map */
-  write_image_flt(imback, nx, ny, fname3);
+  //write_image_flt(imback, nx, ny, fname3);
 
 
   /* subtract background */
@@ -291,7 +295,7 @@ int main(int argc, char **argv)
   if (status) goto exit;
   print_time("sep_extract()", t1-t0);
 
-  /* aperture photometry */
+  /* aperture photometry in circle*/
   fluxt = flux = (double *)malloc(nobj * sizeof(double));
   fluxerrt = fluxerr = (double *)malloc(nobj * sizeof(double));
   areat = area = (double *)malloc(nobj * sizeof(double));
@@ -306,6 +310,44 @@ int main(int argc, char **argv)
   printf("sep_apercirc() [r= 5.0]  %6.3f us/aperture\n",
 	 (double)(t1 - t0) / 1000. / nobj);
 
+  /*transform from a, b, theta to cxx, cyy, cxy*/
+  for (i=0; i<nobj; i++, kronradt++, flagt++){
+    double cxx, cyy, cxy;
+    sep_ellipse_coeffs((double)objects[i].a, (double)objects[i].b, (double)objects[i].theta, &cxx, &cyy, &cxy);
+    objects[i].cxx = (float)cxx;
+    objects[i].cyy = (float)cyy;
+    objects[i].cxy = (float)cxy;
+  }
+  /*kron_radius*/
+  kronradt = kronrad = (double *)malloc(nobj * sizeof(double));
+  flagt = kflag = (short *)malloc(nobj * sizeof(short));
+  for (i=0; i<nobj; i++, kronradt++, flagt++)
+    sep_kron_radius(im, NULL,
+		   SEP_TFLOAT, 0, nx, ny, 0.0,
+		   objects[i].x, objects[i].y, 
+		   objects[i].cxx, objects[i].cyy, objects[i].cxy,
+		   6.0, 
+		   kronradt, flagt);
+
+  /* aperture photometry in ellipse*/
+  fluxt = eflux = (double *)malloc(nobj * sizeof(double));
+  fluxerrt = efluxerr = (double *)malloc(nobj * sizeof(double));
+  areat = earea = (double *)malloc(nobj * sizeof(double));
+  flagt = eflag = (short *)malloc(nobj * sizeof(short));
+  kronradt = kronrad;
+  t0 = gettime_ns();
+  for (i=0; i<nobj; i++, fluxt++, fluxerrt++, flagt++, areat++, kronradt++)
+    sep_sum_ellipse(im, &(bkmap->globalrms), NULL,
+		   SEP_TFLOAT, SEP_TFLOAT, 0, nx, ny, 0.0, 1.0, 0,
+		   objects[i].x, objects[i].y, 
+		   objects[i].a, objects[i].b, objects[i].theta,
+		    (*kronradt)*2.5, 5,
+		   fluxt, fluxerrt, areat, flagt);
+  t1 = gettime_ns();
+  printf("sep_apercirc() [r= 5.0]  %6.3f us/aperture\n",
+	 (double)(t1 - t0) / 1000. / nobj);
+
+
   /* print results */
   printf("writing to file: %s\n", fname2);
   catout = fopen(fname2, "w+");
@@ -315,10 +357,14 @@ int main(int argc, char **argv)
   fprintf(catout, "# 3 Y_IMAGE (0-indexed)\n");
   fprintf(catout, "# 4 FLUX\n");
   fprintf(catout, "# 5 FLUXERR\n");
+  fprintf(catout, "# 6 KRON_RADIUS\n");
+  fprintf(catout, "# 7 FLUX_AUTO\n");
+  fprintf(catout, "# 8 FLUXERR_AUTO\n");
+  fprintf(catout, "# 9 FLAGS\n");
   for (i=0; i<nobj; i++)
     {
-      fprintf(catout, "%3d %#11.7g %#11.7g %#11.7g %#11.7g\n",
-	      i, objects[i].x, objects[i].y, flux[i], fluxerr[i]);
+      fprintf(catout, "%3d %#11.7g %#11.7g %#11.7g %#11.7g %#11.7g %#11.7g %#11.7g %d\n",
+	      i, objects[i].x, objects[i].y, flux[i], fluxerr[i], kronrad[i]*2.5, eflux[i], efluxerr[i], flag[i]);
     }
   fclose(catout);
 
@@ -329,6 +375,11 @@ int main(int argc, char **argv)
   free(flux);
   free(fluxerr);
   free(flag);
+  free(eflux);
+  free(efluxerr);
+  free(eflag);
+  free(kronrad);
+  free(kflag);
   if (status)
     {
       printf("FAILED with status: %d\n", status);
