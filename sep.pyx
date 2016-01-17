@@ -8,13 +8,15 @@ This module is a wrapper of the SEP C library.
 import numpy as np
 cimport numpy as np
 from libc cimport limits
+from libc.math cimport sqrt
 cimport cython
 from cpython.mem cimport PyMem_Malloc, PyMem_Free
+from cpython.version cimport PY_MAJOR_VERSION
 from warnings import warn
 
 np.import_array()  # To access the numpy C-API.
 
-__version__ = "0.3.0"
+__version__ = "0.5.3"
 
 # -----------------------------------------------------------------------------
 # Definitions from the SEP C library
@@ -29,6 +31,10 @@ DEF SEP_TDOUBLE = 82
 DEF SEP_ERROR_IS_VAR = 0x0001
 DEF SEP_ERROR_IS_ARRAY = 0x0002
 DEF SEP_MASK_IGNORE = 0x0004
+
+# filter types for sep_extract
+DEF SEP_FILTER_CONV = 0
+DEF SEP_FILTER_MATCHED = 1
 
 # Output flag values accessible from python
 OBJ_MERGED = np.short(0x0001)
@@ -89,14 +95,16 @@ cdef extern from "sep.h":
 
     int sep_extract(void *image,
                     void *noise,
+                    void *mask,
                     int dtype,
                     int ndtype,
-                    short noise_flag,
+                    int mdtype,
                     int w, int h,
                     float thresh,
                     int minarea,
                     float *conv,
                     int convw, int convh,
+                    int filter_type,
                     int deblend_nthresh,
                     double deblend_cont,
                     int clean_flag,
@@ -147,6 +155,13 @@ cdef extern from "sep.h":
                         double cxx, double cyy, double cxy, double r,
                         double *kronrad, short *flag)
 
+    int sep_windowed(void *data, void *error, void *mask,
+                     int dtype, int edtype, int mdtype, int w, int h,
+                     double maskthresh, double gain, short inflag,
+                     double x, double y, double sig, int subpix,
+                     double *xout, double *yout, int *niter, short *flag,
+                     double* extrastats)
+
     int sep_ellipse_axes(double cxx, double cyy, double cxy,
                          double *a, double *b, double *theta)
 
@@ -173,16 +188,16 @@ cdef int _get_sep_dtype(dtype) except -1:
         raise ValueError(
             "Input array with dtype '{0}' has non-native byte order. "
             "Only native byte order arrays are supported. "
-            "Arrays can be converted to native byte order in-place "
-            "with 'a = a.byteswap(True).newbyteorder()'".format(dtype))
+            "To change the byte order of the array 'data', do "
+            "'data = data.byteswap().newbyteorder()'".format(dtype))
     t = dtype.type
     if t is np.single:
         return SEP_TFLOAT
     elif t is np.bool_ or t is np.ubyte:
         return SEP_TBYTE
-    elif t == np.double:
+    elif dtype == np.double:
         return SEP_TDOUBLE
-    elif t == np.intc:
+    elif dtype == np.intc:
         return SEP_TINT
     raise ValueError('input array dtype not supported: {0}'.format(dtype))
 
@@ -215,30 +230,38 @@ cdef int _assert_ok(int status) except -1:
     """Get the SEP error message corresponding to status code"""
     cdef char *errmsg
     cdef char *errdetail
-    cdef bytes pyerrmsg
-    cdef bytes pyerrdetail
-    cdef bytes separator
 
     if status == 0:
         return 0
+
+    # First check if we have an out-of-memory error, so we don't try to
+    # allocate more memory to hold the error message.
     if status == MEMORY_ALLOC_ERROR:
         raise MemoryError
 
-    # otherwise, get error message
+    # Otherwise, get error message.
     errmsg = <char *>PyMem_Malloc(61 * sizeof(char))
     sep_get_errmsg(status, errmsg)
-    pyerrmsg = errmsg
+    pyerrmsg = <bytes> errmsg
     PyMem_Free(errmsg)
 
+    # Get error detail.
     errdetail = <char *>PyMem_Malloc(512 * sizeof(char))
     sep_get_errdetail(errdetail)
-    pyerrdetail = errdetail
+    pyerrdetail = <bytes> errdetail
     PyMem_Free(errdetail)
 
-    if pyerrdetail == "":
-        raise Exception(pyerrmsg)
+    # If error detail is present, append it to the message.
+    if pyerrdetail != b"":
+        pyerrmsg = pyerrmsg + b": " + pyerrdetail
+
+    # Convert string to unicode if on python 3
+    if PY_MAJOR_VERSION == 3:
+        msg = pyerrmsg.decode()
     else:
-        raise Exception(pyerrmsg + ": " + pyerrdetail)
+        msg = pyerrmsg
+
+    raise Exception(msg)
 
 
 cdef int _parse_arrays(np.ndarray data, err, var, mask,
@@ -447,6 +470,8 @@ cdef class Background:
 
         Subtract the background from an existing array.
 
+        Like ``data = data - bkg``, but avoids making a copy of the data.
+
         Parameters
         ----------
         data : `~numpy.ndarray`
@@ -470,6 +495,14 @@ cdef class Background:
 
         status = sep_subbackarray(self.ptr, &buf[0, 0], sep_dtype)
         _assert_ok(status)
+
+    def __array__(self, dtype=None):
+        return self.back(dtype=dtype)
+
+    def __rsub__(self, np.ndarray data not None):
+        data = np.copy(data)
+        self.subfrom(data)
+        return data
 
     def __dealloc__(self):
         if self.ptr is not NULL:
@@ -508,18 +541,20 @@ cdef packed struct Object:
     np.int_t ypeak
     np.int_t flag
 
-default_conv = np.array([[1.0, 2.0, 1.0],
-                         [2.0, 4.0, 2.0],
-                         [1.0, 2.0, 1.0]], dtype=np.float32)
+default_kernel = np.array([[1.0, 2.0, 1.0],
+                           [2.0, 4.0, 2.0],
+                           [1.0, 2.0, 1.0]], dtype=np.float32)
 
 def extract(np.ndarray data not None, float thresh, np.ndarray err=None,
-            int minarea=5,
-            np.ndarray conv=default_conv, int deblend_nthresh=32,
-            double deblend_cont=0.005, bint clean=True,
-            double clean_param=1.0):
-    """extract(data, thresh, err=None, minarea=5, conv=default_conv,
+            np.ndarray mask=None, int minarea=5,
+            np.ndarray filter_kernel=default_kernel, filter_type='matched',
+            int deblend_nthresh=32, double deblend_cont=0.005,
+            bint clean=True, double clean_param=1.0,
+            segmentation_map=False, np.ndarray conv=default_kernel):
+    """extract(data, thresh, err=None, mask=None, minarea=5,
+               filter_kernel=default_kernel, filter_type='matched',
                deblend_nthresh=32, deblend_cont=0.005, clean=True,
-               clean_param=1.0)
+               clean_param=1.0, segmentation_map=False)
 
     Extract sources from an image.
 
@@ -534,25 +569,43 @@ def extract(np.ndarray data not None, float thresh, np.ndarray err=None,
         threshold at pixel (j, i) will be ``thresh * err[j, i]``.
     err : `~numpy.ndarray`, optional
         Noise array for specifying a pixel-by-pixel detection threshold.
+    mask : `~numpy.ndarray`, optional
+        Mask array. ``True`` values, or numeric values greater than 0,
+        are considered masked. Masking a pixel is equivalent to setting data
+        to zero and noise (if present) to infinity.
     minarea : int, optional
         Minimum number of pixels required for an object. Default is 5.
-    conv : `~numpy.ndarray` or None, optional
-        Convolution kernel used for on-the-fly image convolution (used to
+    filter_kernel : `~numpy.ndarray` or None, optional
+        Filter kernel used for on-the-fly filtering (used to
         enhance detection). Default is a 3x3 array:
         [[1,2,1], [2,4,2], [1,2,1]]. Set to ``None`` to skip
         convolution.
+    filter_type : {'matched', 'conv'}, optional
+        Filter treatment. This affects filtering behavior when a noise
+        array is supplied. ``'matched'`` (default) accounts for
+        pixel-to-pixel noise in the filter kernel. ``'conv'`` is
+        simple convolution of the data array, ignoring pixel-to-pixel
+        noise across the kernel.  ``'matched'`` should yield better
+        detection of faint sources in areas of rapidly varying noise
+        (such as found in coadded images made from semi-overlapping
+        exposures).  The two options are equivalent when noise is
+        constant.
     deblend_nthresh : int, optional
         Number of thresholds used for object deblending. Default is 32.
     deblend_cont : float, optional
         Minimum contrast ratio used for object deblending. Default is 0.005.
+        To entirely disable deblending, set to 1.0.
     clean : bool, optional
         Perform cleaning? Default is True.
     clean_param : float, optional
         Cleaning parameter (see SExtractor manual). Default is 1.0.
+    segmentation_map : bool, optional
+        If True, also return a "segmentation map" giving the member
+        pixels of each object. Default is False.
 
     Returns
     -------
-    objects : np.ndarray
+    objects : `~numpy.ndarray`
         Extracted object parameters (structured array). Available fields are:
 
         * ``thresh`` (float) Threshold at object location.
@@ -572,17 +625,28 @@ def extract(np.ndarray data not None, float thresh, np.ndarray err=None,
         * ``xpeak``, ``ypeak`` (int) Coordinate of convolved peak pixel.
         * ``flag`` (int) Extraction flags.
 
+    segmap : `~numpy.ndarray`, optional
+        Array of integers with same shape as data. Pixels not belonging to
+        any object have value 0. All pixels belonging to the ``i``-th object
+        (e.g., ``objects[i]``) have value ``i+1``. Only returned if
+        ``segmentation_map=True``.
     """
 
-    cdef int w, h, convw, convh, status, sep_dtype, nobj, i
+    cdef int w, h, kernelw, kernelh, status, sep_dtype, nobj, i, j
+    cdef int filter_typecode
     cdef np.uint8_t[:, :] buf
     cdef np.uint8_t[:, :] noise_buf
+    cdef np.uint8_t[:, :] mask_buf
     cdef sepobj *objects
     cdef np.ndarray[Object] result
-    cdef float[:, :] convflt
-    cdef float *convptr
+    cdef float[:, :] kernelflt
+    cdef float *kernelptr
     cdef np.uint8_t *noise_ptr
-    cdef int noise_dtype
+    cdef np.uint8_t *mask_ptr
+    cdef int noise_dtype, mask_dtype
+    cdef np.int32_t[:, :] segmap_buf
+    cdef np.int32_t *segmap_ptr
+    cdef int *objpix
 
     _check_array_get_dims(data, &w, &h)
     sep_dtype = _get_sep_dtype(data.dtype)
@@ -593,24 +657,49 @@ def extract(np.ndarray data not None, float thresh, np.ndarray err=None,
         noise_dtype = 0
     else:
         noise_buf = err.view(dtype=np.uint8)
-        noise_ptr = &noise_buf[0,0]
+        noise_ptr = &noise_buf[0, 0]
         noise_dtype = _get_sep_dtype(err.dtype)
 
-    # Parse convolution input
-    if conv is None:
-        convptr = NULL
-        convw = 0
-        convh = 0
+    if mask is None:
+        mask_ptr = NULL
+        mask_dtype = 0
     else:
-        convflt = conv.astype(np.float32)
-        convptr = &convflt[0, 0]
-        convw = convflt.shape[1]
-        convh = convflt.shape[0]
+        mask_buf = mask.view(dtype=np.uint8)
+        mask_ptr = &mask_buf[0, 0]
+        mask_dtype = _get_sep_dtype(mask.dtype)
 
-    status = sep_extract(&buf[0,0], noise_ptr, sep_dtype, noise_dtype, 0, w, h,
-                         thresh, minarea, convptr, convw, convh,
-                         deblend_nthresh, deblend_cont, clean, clean_param,
-                         &objects, &nobj)
+    # 'conv' has been renamed to filter_kernel. If the user has set it
+    # explicitly, issue a warning. Don't use DeprecationWarning: no one will
+    # ever see it.
+    if conv is not default_kernel:
+        warn("The 'conv' keyword argument is deprecated. Use the "
+             "'filter_kernel' keyword argument instead.")
+        if filter_kernel is default_kernel:
+            filter_kernel = conv
+
+    # Parse filter input
+    if filter_kernel is None:
+        kernelptr = NULL
+        kernelw = 0
+        kernelh = 0
+    else:
+        kernelflt = filter_kernel.astype(np.float32)
+        kernelptr = &kernelflt[0, 0]
+        kernelw = kernelflt.shape[1]
+        kernelh = kernelflt.shape[0]
+
+    if filter_type == 'matched':
+        filter_typecode = SEP_FILTER_MATCHED
+    elif filter_type == 'conv':
+        filter_typecode = SEP_FILTER_CONV
+    else:
+        raise ValueError("unknown filter_type: {!r}".format(filter_type))
+
+    status = sep_extract(&buf[0,0], noise_ptr, mask_ptr,
+                         sep_dtype, noise_dtype, mask_dtype, w, h,
+                         thresh, minarea, kernelptr, kernelw, kernelh,
+                         filter_typecode, deblend_nthresh, deblend_cont,
+                         clean, clean_param, &objects, &nobj)
     _assert_ok(status)
 
     # Allocate result record array and fill it
@@ -671,10 +760,26 @@ def extract(np.ndarray data not None, float thresh, np.ndarray err=None,
         result['ypeak'][i] = objects[i].ypeak
         result['flag'][i] = objects[i].flag
 
+    # construct a segmentation map, if it was requested.
+    if segmentation_map:
+        # Note: We have to write out `(data.shape[0], data.shape[1])` because
+        # because Cython turns `data.shape` later into an int pointer when
+        # the function argument is typed as np.ndarray.
+        segmap = np.zeros((data.shape[0], data.shape[1]), dtype=np.int32)
+        segmap_buf = segmap
+        segmap_ptr = &segmap_buf[0, 0]
+        for i in range(nobj):
+            objpix = objects[i].pix
+            for j in range(objects[i].npix):
+                segmap_ptr[objpix[j]] = i + 1
+
     # Free C array
     sep_freeobjarray(objects, nobj)
 
-    return result
+    if segmentation_map:
+        return result, segmap
+    else:
+        return result
 
 # -----------------------------------------------------------------------------
 # Aperture Photometry
@@ -847,7 +952,7 @@ def sum_circle(np.ndarray data not None, x, y, r,
 
             flux1 -= bkgflux / bkgarea * area1
             bkgfluxerr = bkgfluxerr / bkgarea * area1
-            fluxerr1 = fluxerr1*fluxerr1 + bkgfluxerr*bkgfluxerr
+            fluxerr1 = sqrt(fluxerr1*fluxerr1 + bkgfluxerr*bkgfluxerr)
             (<double*>np.PyArray_MultiIter_DATA(it, 5))[0] = flux1
             (<double*>np.PyArray_MultiIter_DATA(it, 6))[0] = fluxerr1
             (<short*>np.PyArray_MultiIter_DATA(it, 7))[0] = flag1
@@ -1001,7 +1106,11 @@ def sum_ellipse(np.ndarray data not None, x, y, a, b, theta, r=1.0,
         ``[-pi/2, pi/2]``. It is also required that ``a >= b >= 0.0``. 
 
     r : array_like, optional
-        Scaling factor for the ellipse. Default is 1.0.
+        Scaling factor for the semi-minor and semi-major axes. The
+        actual ellipse used will have semi-major axis ``a * r`` and
+        semi-minor axis ``b * r``. Setting this parameter to a value
+        other than 1.0 is exactly equivalent to scaling both ``a`` and
+        ``b`` by the same value. Default is 1.0.
 
     err, var : float or `~numpy.ndarray`
         Error *or* variance (specify at most one).
@@ -1038,6 +1147,7 @@ def sum_ellipse(np.ndarray data not None, x, y, a, b, theta, r=1.0,
 
     flags : `~numpy.ndarray`
         Integer giving flags. (0 if no flags set.)
+
     """
 
     cdef double flux1, fluxerr1, x1, y1, r1, area1, rin1, rout1
@@ -1152,7 +1262,7 @@ def sum_ellipse(np.ndarray data not None, x, y, a, b, theta, r=1.0,
 
             flux1 -= bkgflux / bkgarea * area1
             bkgfluxerr = bkgfluxerr / bkgarea * area1
-            fluxerr1 = fluxerr1*fluxerr1 + bkgfluxerr*bkgfluxerr
+            fluxerr1 = sqrt(fluxerr1*fluxerr1 + bkgfluxerr*bkgfluxerr)
 
             (<double*>np.PyArray_MultiIter_DATA(it, 8))[0] = flux1
             (<double*>np.PyArray_MultiIter_DATA(it, 9))[0] = fluxerr1
@@ -1636,6 +1746,114 @@ def kron_radius(np.ndarray data not None, x, y, a, b, theta, r,
 
     return kr, flag 
 
+def winpos(np.ndarray data not None, xinit, yinit, sig,
+           np.ndarray mask=None, double maskthresh=0.0, int subpix=11):
+    """winpos(data, xinit, yinit, sig, mask=None, maskthresh=0.0, subpix=11)
+
+    Calculate more accurate object centroids using 'windowed' algorithm.
+
+    Starting from the supplied initial center position, an iterative
+    algorithm is used to determine a better object centroid. On each
+    iteration, the centroid is calculated using all pixels within a
+    circular aperture of ``4*sig`` from the current position,
+    weighting pixel positions by their flux and the amplitude of a 2-d
+    Gaussian with sigma ``sig``. Iteration stops when the change in
+    position falls under some threshold or a maximum number of
+    iterations is reached. This is equivalent to ``XWIN_IMAGE`` and
+    ``YWIN_IMAGE`` parameters in Source Extractor (for the correct choice
+    of sigma for each object).
+
+    Parameters
+    ----------
+    data : `~numpy.ndarray`
+        Data array.
+
+    xinit, yinit : array_like
+        Initial center(s).
+
+    sig : array_like
+        Gaussian sigma used for weighting pixels. Pixels within a circular
+        aperture of radius 4*sig are included.
+
+    mask : `numpy.ndarray`, optional
+        An optional mask.
+
+    maskthresh : float, optional
+        Pixels with mask > maskthresh will be ignored.
+
+    subpix : int
+        Subpixel sampling used to determine pixel overlap with
+        aperture.  11 is used in Source Extractor. For exact overlap
+        calculation, use 0.
+
+    Returns
+    -------
+    x, y : np.ndarray
+        New x and y position(s).
+
+    flag : np.ndarray
+        Flags.
+
+    """
+
+    cdef int w, h, mw, mh, status
+    cdef np.uint8_t[:,:] buf, mbuf
+    cdef void *ptr
+    cdef void *mptr
+    cdef double cxx, cyy, cxy
+    cdef int niter
+
+    niter = 0  # not currently used or returned.
+
+    mptr = NULL
+    mdtype = 0
+
+    # Get main image info
+    _check_array_get_dims(data, &w, &h)
+    dtype = _get_sep_dtype(data.dtype)
+    buf = data.view(dtype=np.uint8)
+    ptr = <void*>&buf[0, 0]
+
+    # See note in apercirc on requiring specific array type
+    dt = np.dtype(np.double)
+    xinit = np.require(xinit, dtype=dt)
+    yinit = np.require(yinit, dtype=dt)
+    sig = np.require(sig, dtype=dt)
+
+    if mask is not None:
+        _check_array_get_dims(mask, &mw, &mh)
+        if mw != w or mh != h:
+            raise ValueError("size of mask array must match data")
+        mdtype = _get_sep_dtype(mask.dtype)
+        mbuf = mask.view(dtype=np.uint8)
+        mptr = <void*>&mbuf[0, 0]
+
+    # allocate output arrays
+    shape = np.broadcast(xinit, yinit, sig).shape
+    x = np.empty(shape, np.float)
+    y = np.empty(shape, np.float)
+    flag = np.empty(shape, np.short)
+
+    it = np.broadcast(xinit, yinit, sig, x, y, flag)
+    while np.PyArray_MultiIter_NOTDONE(it):
+        status = sep_windowed(ptr, NULL, mptr, dtype, 0, mdtype, w, h,
+                              maskthresh, 0., 0,
+                              (<double*>np.PyArray_MultiIter_DATA(it, 0))[0],
+                              (<double*>np.PyArray_MultiIter_DATA(it, 1))[0],
+                              (<double*>np.PyArray_MultiIter_DATA(it, 2))[0],
+                              subpix,
+                              <double*>np.PyArray_MultiIter_DATA(it, 3),
+                              <double*>np.PyArray_MultiIter_DATA(it, 4),
+                              &niter,
+                              <short*>np.PyArray_MultiIter_DATA(it, 5),
+                              NULL)
+        _assert_ok(status);
+        np.PyArray_MultiIter_NEXT(it)
+
+    return x, y, flag 
+
+
+
 def ellipse_coeffs(a, b, theta):
     """ellipse_coeffs(a, b, theta)
 
@@ -1743,11 +1961,20 @@ def ellipse_axes(cxx, cyy, cxy):
 # Utility functions
 
 def set_extract_pixstack(size_t size):
-    """Set the size in pixels of the internal pixel buffer used in extract()"""
+    """set_extract_pixstack(size)
+
+    Set the size in pixels of the internal pixel buffer used in extract().
+
+    The current value can be retrieved with get_extract_pixstack. The
+    initial default is 300000.
+    """
     sep_set_extract_pixstack(size)
 
 def get_extract_pixstack():
-    """Get the size in pixels of the internal pixel buffer used in extract()"""
+    """get_extract_pixstack()
+
+    Get the size in pixels of the internal pixel buffer used in extract().
+    """
     return sep_get_extract_pixstack()
 
 # -----------------------------------------------------------------------------

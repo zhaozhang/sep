@@ -24,7 +24,7 @@
 
 #define DETAILSIZE 512
 
-char *sep_version_string = "0.2.0.dev";
+char *sep_version_string = "0.5.0";
 static char _errdetail_buffer[DETAILSIZE] = "";
 
 /****************************************************************************/
@@ -276,6 +276,9 @@ void sep_get_errmsg(int status, char *errtext)
       break;
     case ILLEGAL_APER_PARAMS:
       strcpy(errtext, "invalid aperture parameters");
+      break;
+    case LINE_NOT_IN_BUF:
+      strcpy(errtext, "array line out of buffer");
       break;
     default:
        strcpy(errtext, "unknown error status");

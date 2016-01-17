@@ -57,14 +57,124 @@ void plistinit(void *, void *);
 void clean(objliststruct *objlist, double clean_param, int *survives);
 int convertobj(int l, objliststruct *objlist, sepobj *objout, int w);
 
+int arraybuffer_init(arraybuffer *buf, void *arr, int dtype, int w, int h,
+                     int bufw, int bufh);
+void arraybuffer_readline(arraybuffer *buf);
+void arraybuffer_free(arraybuffer *buf);
+
+/********************* array buffer functions ********************************/
+
+/* initialize buffer */
+/* bufw must be less than or equal to w */
+int arraybuffer_init(arraybuffer *buf, void *arr, int dtype, int w, int h,
+                     int bufw, int bufh)
+{
+  int status, yl;
+  status = RETURN_OK;
+
+  /* data info */
+  buf->dptr = arr;
+  buf->dw = w;
+  buf->dh = h;
+
+  /* buffer array info */
+  buf->bptr = NULL;
+  QMALLOC(buf->bptr, PIXTYPE, bufw*bufh, status);
+  buf->bw = bufw;
+  buf->bh = bufh;
+
+  /* pointers to within buffer */
+  buf->midline = buf->bptr + bufw*(bufh/2);  /* ptr to middle buffer line */
+  buf->lastline = buf->bptr + bufw*(bufh-1);  /* ptr to last buffer line */
+
+  status = get_array_converter(dtype, &(buf->readline), &(buf->elsize));
+  if (status != RETURN_OK)
+    goto exit;
+
+  /* initialize yoff */
+  buf->yoff = -bufh;
+
+  /* read in lines until the first data line is one line above midline */
+  for (yl=0; yl < bufh - bufh/2 - 1; yl++)
+    arraybuffer_readline(buf);
+
+  return status;
+
+ exit:
+  free(buf->bptr);
+  buf->bptr = NULL;
+  return status;
+}
+
+/* read a line into the buffer at the top, shifting all lines down one */
+void arraybuffer_readline(arraybuffer *buf)
+{
+  PIXTYPE *line;
+  int y;
+
+  /* shift all lines down one */
+  for (line = buf->bptr; line < buf->lastline; line += buf->bw)
+    memcpy(line, line + buf->bw, sizeof(PIXTYPE) * buf->bw);
+
+  /* which image line now corresponds to the last line in buffer? */
+  buf->yoff++;
+  y = buf->yoff + buf->bh - 1;
+
+  if (y < buf->dh)
+    buf->readline(buf->dptr + buf->elsize * buf->dw * y, buf->dw,
+                  buf->lastline);
+
+  return;
+}
+
+void arraybuffer_free(arraybuffer *buf)
+{
+  free(buf->bptr);
+  buf->bptr = NULL;
+}
+
+/* apply_mask_line: Apply the mask to the image and noise buffers.
+ *
+ * If convolution is off, masked values should simply be not
+ * detected. For this, would be sufficient to either set data to zero or
+ * set noise (if present) to infinity.
+ *
+ * If convolution is on, strictly speaking, a masked (unknown) pixel
+ * should "poison" the convolved value whenever it is present in the
+ * convolution kernel (e.g., NaN behavior). However, practically we'd
+ * rather use a "best guess" for the value. Without doing
+ * interpolation from neighbors, 0 is the best guess (assuming image
+ * is background subtracted).
+ *
+ * For the purpose of the full matched filter, we should set noise = infinity.
+ *
+ * So, this routine sets masked pixels to zero in the image buffer and
+ * infinity in the noise buffer (if present). It affects the first 
+ */
+void apply_mask_line(arraybuffer *mbuf, arraybuffer *imbuf, arraybuffer *nbuf)
+{
+  int i;
+  
+  for (i=0; i<mbuf->bw; i++)
+    {
+      if (mbuf->lastline[i] > 0.0)
+        {
+          imbuf->lastline[i] = 0.0;
+          if (nbuf)
+            nbuf->lastline[i] = BIG;
+        }
+    }
+}
+
 /****************************** extract **************************************/
-int sep_extract(void *image, void *noise,
-		int dtype, int ndtype, short noise_flag, int w, int h,
+int sep_extract(void *image, void *noise, void *mask,
+                int dtype, int ndtype, int mdtype, int w, int h,
 	        float thresh, int minarea, float *conv, int convw, int convh,
-		int deblend_nthresh, double deblend_cont,
+		int filter_type, int deblend_nthresh, double deblend_cont,
 		int clean_flag, double clean_param,
 		sepobj **objects, int *nobj)
 {
+  arraybuffer       imbuf, nbuf, mbuf;
   infostruct        curpixinfo, initinfo, freeinfo;
   objliststruct     objlist;
   char              newmarker;
@@ -72,7 +182,7 @@ int sep_extract(void *image, void *noise,
   int               nposize, oldnposize;
   int               co, i, j, luflag, pstop, xl, xl2, yl, cn;
   int               stacksize, convn, status;
-  int               elsize_im, elsize_noise;
+  int               bufh;
   short             trunflag;
   PIXTYPE           relthresh, cdnewsymbol;
   float             sum;
@@ -82,19 +192,18 @@ int sep_extract(void *image, void *noise,
   objliststruct     *finalobjlist;
   pliststruct	    *pixel, *pixt;
   char              *marker;
-  PIXTYPE           *scan, *cdscan, *cdwscan, *wscan, *dumscan;
+  PIXTYPE           *scan, *cdscan, *wscan, *dummyscan;
+  PIXTYPE           *sigscan, *workscan;
   float             *convnorm;
   int               *start, *end, *survives;
   pixstatus         *psstack;
-  BYTE              *imageline, *noiseline;
-  convolver         convolve_im, convolve_noise;
-  array_converter   convert_im, convert_noise;
   char              errtext[512];
 
   status = RETURN_OK;
   pixel = NULL;
   convnorm = NULL;
-  scan = wscan = cdscan = cdwscan = dumscan = NULL;
+  scan = wscan = cdscan = dummyscan = NULL;
+  sigscan = workscan = NULL;
   info = NULL;
   store = NULL;
   marker = NULL;
@@ -103,12 +212,6 @@ int sep_extract(void *image, void *noise,
   finalobjlist = NULL; /* final return value */
   convn = 0;
   sum = 0.0;
-  convolve_im = NULL;
-  convolve_noise = NULL;
-  convert_im = NULL;
-  convert_noise = NULL;
-  imageline = (BYTE *)image;
-  noiseline = (BYTE *)noise;
 
   mem_pixstack = sep_get_extract_pixstack();
 
@@ -127,7 +230,7 @@ int sep_extract(void *image, void *noise,
   QMALLOC(info, infostruct, stacksize, status);
   QCALLOC(store, infostruct, stacksize, status);
   QMALLOC(marker, char, stacksize, status);
-  QMALLOC(dumscan, PIXTYPE, stacksize, status);
+  QMALLOC(dummyscan, PIXTYPE, stacksize, status);
   QMALLOC(psstack, pixstatus, stacksize, status);
   QCALLOC(start, int, stacksize, status);
   QMALLOC(end, int, stacksize, status);
@@ -136,18 +239,34 @@ int sep_extract(void *image, void *noise,
   if ((status = allocdeblend(deblend_nthresh)) != RETURN_OK)
     goto exit;
 
-  /* allocate scan buffer(s) and get array converter function(s) */
-  QMALLOC(scan, PIXTYPE, stacksize, status);
-  status = get_array_converter(dtype, &convert_im, &elsize_im);
+  /* Initialize buffers for input array(s).
+   * The buffer size depends on whether or not convolution is active.
+   * If not convolving, the buffer size is just a single line. If convolving,
+   * the buffer height equals the height of the convolution kernel.
+   */
+  bufh = conv ? convh : 1;
+  status = arraybuffer_init(&imbuf, image, dtype, w, h, stacksize, bufh);
   if (status != RETURN_OK)
     goto exit;
   if (noise)
     {
-      QMALLOC(wscan, PIXTYPE, stacksize, status);
-      status = get_array_converter(ndtype, &convert_noise, &elsize_noise);
+      status = arraybuffer_init(&nbuf, noise, ndtype, w, h, stacksize, bufh);
       if (status != RETURN_OK)
-	goto exit;
+        goto exit;
     }
+  if (mask)
+    {
+      status = arraybuffer_init(&mbuf, mask, mdtype, w, h, stacksize, bufh);
+      if (status != RETURN_OK)
+        goto exit;
+    }
+
+  /* `scan` (or `wscan`) is always a pointer to the current line being
+   * processed. It might be the only line in the buffer, or it might be the 
+   * middle line. */
+  scan = imbuf.midline;
+  if (noise)
+    wscan = nbuf.midline;
 
   /* More initializations */
   initinfo.pixnb = 0;
@@ -157,7 +276,7 @@ int sep_extract(void *image, void *noise,
   for (xl=0; xl<stacksize; xl++)
     {
     marker[xl]  = 0 ;
-    dumscan[xl] = -BIG ;
+    dummyscan[xl] = -BIG ;
     }
 
   co = pstop = 0;
@@ -187,12 +306,20 @@ int sep_extract(void *image, void *noise,
     PLIST(pixt, nextpix) = i;
   PLIST(pixt, nextpix) = -1;
 
+  /* can only use a matched filter when convolving and when there is a noise
+   * array */
+  if (!(conv && noise))
+    filter_type = SEP_FILTER_CONV;
+
   if (conv)
     {
       /* allocate memory for convolved buffers */
       QMALLOC(cdscan, PIXTYPE, stacksize, status);
-      if (noise)
-	QCALLOC(cdwscan, PIXTYPE, stacksize, status);
+      if (filter_type == SEP_FILTER_MATCHED)
+        {
+          QMALLOC(sigscan, PIXTYPE, stacksize, status);
+          QMALLOC(workscan, PIXTYPE, stacksize, status);
+        }
 
       /* normalize the filter */
       convn = convw * convh;
@@ -201,18 +328,6 @@ int sep_extract(void *image, void *noise,
 	sum += fabs(conv[i]);
       for (i=0; i<convn; i++)
 	convnorm[i] = conv[i] / sum;
-
-      /* get the right convolve function for the image & noise data types */
-      status = get_convolver(dtype, &convolve_im);
-      if (status != RETURN_OK)
-	goto exit;
-      if (noise)
-	{
-	  status = get_convolver(ndtype, &convolve_noise);
-	  if (status != RETURN_OK)
-	    goto exit;
-	}
-
     }
 
   /*----- MAIN LOOP ------ */
@@ -229,41 +344,44 @@ int sep_extract(void *image, void *noise,
 	    {
 	      free(cdscan);
 	      cdscan = NULL;
-	      if (noise)
-		{
-		  free(cdwscan);
-		  cdwscan = NULL;
-		}
 	    }
-	  cdwscan = cdscan = dumscan;
+	  cdscan = dummyscan;
 	}
 
       else
 	{
-	  /* read the current (yl) line of input arrays into PIXTYPE buffers*/
-	  convert_im(imageline, w, scan);
-	  if (noise)
-	    convert_noise(noiseline, w, wscan);
+          arraybuffer_readline(&imbuf);
+          if (noise)
+            arraybuffer_readline(&nbuf);
+          if (mask)
+            {
+              arraybuffer_readline(&mbuf);
+              apply_mask_line(&mbuf, &imbuf, (noise? &nbuf: NULL));
+            }
 
 	  /* filter the lines */
 	  if (conv)
 	    {
-	      convolve_im(image, w, h, yl, convnorm, convw, convh, cdscan);
-	      if (noise)
-		
-		/*debug: don't convolve noise*/
-		memcpy(cdwscan, wscan, (size_t)w*sizeof(PIXTYPE));
-		/*convolve_noise(noise, w, h, yl, convnorm, convw, convh,
-		  cdwscan); */
-	    }
+              status = convolve(&imbuf, yl, convnorm, convw, convh, cdscan);
+              if (status != RETURN_OK)
+                goto exit;
+
+	      if (filter_type == SEP_FILTER_MATCHED)
+                {
+                  status = matched_filter(&imbuf, &nbuf, yl, convnorm, convw,
+                                          convh, workscan, sigscan);
+
+                  if (status != RETURN_OK)
+                    goto exit;
+                }
+            }
 	  else
 	    {
 	      cdscan = scan;
-	      cdwscan = wscan;
 	    }	  
 	}
       
-      trunflag = (yl==0 || yl==h-1)? SEP_OBJ_TRUNC:0;
+      trunflag = (yl==0 || yl==h-1)? SEP_OBJ_TRUNC: 0;
       
       for (xl=0; xl<=w; xl++)
 	{
@@ -276,9 +394,15 @@ int sep_extract(void *image, void *noise,
 	  marker[xl] = 0;
 
 	  curpixinfo.flag = trunflag;
+
 	  if (noise)
-	    thresh = relthresh * ((xl==w || yl==h)? 0.0: cdwscan[xl]);
-	  luflag = cdnewsymbol > thresh? 1: 0;  /* is pixel above thresh? */
+            thresh = relthresh * ((xl==w || yl==h)? 0.0: wscan[xl]);
+
+          /* luflag: is pixel above thresh (Y/N)? */
+          if (filter_type == SEP_FILTER_MATCHED)
+            luflag = ((xl != w) && (sigscan[xl] > relthresh))? 1: 0;
+          else
+            luflag = cdnewsymbol > thresh? 1: 0;
 
 	  if (luflag)
 	    {
@@ -312,8 +436,9 @@ int sep_extract(void *image, void *noise,
 			  "The limit of %d active object pixels over the "
 			  "detection threshold was reached. Check that "
 			  "the image is background subtracted and the "
-			  "detection threshold is not too low."
-			  " detection threshold.",
+			  "detection threshold is not too low. If you "
+                          "need to increase the limit, use "
+                          "sep.set_extract_pixstack.",
 			  (int)mem_pixstack);
 		  put_errdetail(errtext);
 		  goto exit;
@@ -476,11 +601,6 @@ int sep_extract(void *image, void *noise,
 
 	} /*------------ End of the loop over the x's -----------------------*/
 
-      /* increment array pointers */ 
-      imageline += w*elsize_im;
-      if (noise)
-	noiseline += w*elsize_noise;
-
     } /*---------------- End of the loop over the y's -----------------------*/
 
   /* convert `finalobjlist` to an array of `sepobj` structs */
@@ -527,19 +647,26 @@ int sep_extract(void *image, void *noise,
   free(info);
   free(store);
   free(marker);
-  free(dumscan);
+  free(dummyscan);
   free(psstack);
   free(start);
   free(end);
-  free(scan);
-  free(wscan);
+  arraybuffer_free(&imbuf);
+  if (noise)
+    arraybuffer_free(&nbuf);
+  if (mask)
+    arraybuffer_free(&mbuf);
   if (conv)
     free(convnorm);
+  if (filter_type == SEP_FILTER_MATCHED)
+    {
+      free(sigscan);
+      free(workscan);
+    }
 
   if (status != RETURN_OK)
     {
       free(cdscan);   /* only need to free these in case of early exit */
-      free(cdwscan);
       *objects = NULL;
       *nobj = 0;
     }

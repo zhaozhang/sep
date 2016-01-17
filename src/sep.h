@@ -41,6 +41,10 @@
 #define SEP_ERROR_IS_ARRAY   0x0002
 #define SEP_MASK_IGNORE      0x0004
 
+/* filter types for sep_extract */
+#define SEP_FILTER_CONV    0
+#define SEP_FILTER_MATCHED 1
+
 /*--------------------- global background estimation ------------------------*/
 
 typedef struct
@@ -133,15 +137,17 @@ typedef struct
 
 int sep_extract(void *image,          /* image array                         */
 		void *noise,          /* noise array (can be NULL)    [NULL] */
+                void *mask,           /* mask array (can be NULL)     [NULL] */
 		int dtype,            /* data type of image                  */
 		int ndtype,           /* data type of noise                  */
-		short noise_flag,     /* See detail below.                   */
+                int mdtype,           /* data type of mask                   */
 		int w, int h,         /* width, height of image & noise      */
 		float thresh,         /* detection threshold     [1.5*sigma] */
 		int minarea,          /* minimum area in pixels          [5] */
 		float *conv,          /* convolution array (can be NULL)     */
                                       /*               [{1 2 1 2 4 2 1 2 1}] */
 		int convw, int convh, /* w, h of convolution array     [3,3] */
+                int filter_type,      /* convolution (0) or matched (1)  [0] */
 		int deblend_nthresh,  /* deblending thresholds          [32] */
 		double deblend_cont,  /* min. deblending contrast    [0.005] */
 		int clean_flag,       /* perform cleaning?               [1] */
@@ -158,10 +164,8 @@ int sep_extract(void *image,          /* image array                         */
  * image and noise arrays, respectively.
  *
  * If `noise` is NULL, thresh is interpreted as an absolute threshold.
- *
  * If `noise` is not null, thresh is interpreted as a relative threshold
- * (the absolute threshold will be thresh*noise). `noise_flag` can be used
- * to alter this behavior.
+ * (the absolute threshold will be thresh*noise[i,j]).
  * 
  */
 
@@ -290,6 +294,27 @@ int sep_kron_radius(void *data, void *mask, int dtype, int mdtype,
  * SEP_APER_NONPOSITIVE - There was a nonpositive numerator or deminator.
  *                        kronrad = 0.
  */
+
+
+int sep_windowed(void *data, void *error, void *mask,
+                 int dtype, int edtype, int mdtype, int w, int h,
+                 double maskthresh, double gain, short inflag,
+                 double x, double y, double sig, int subpix,
+                 double *xout, double *yout, int *niter, short *flag,
+                 double* extrastats);
+/* Calculate "windowed" position parameters.
+ *
+ * This is an iterative procedure.
+ *
+ * x, y       : initial center
+ * sig        : sigma of Gaussian to use for weighting. The integration
+ *              radius is 4 * sig.
+ * subpix     : Subpixels to use in aperture-pixel overlap.
+ *              SExtractor uses 11. 0 is supported for exact overlap.
+ * xout, yout : output center.
+ * niter      : number of iterations used.
+ */
+
 
 void sep_set_ellipse(unsigned char *arr, int w, int h,
 		     double x, double y, double cxx, double cyy, double cxy,

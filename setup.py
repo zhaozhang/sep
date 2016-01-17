@@ -3,6 +3,8 @@ import os
 from glob import glob
 from distutils.core import setup
 from distutils.extension import Extension
+import re
+
 import numpy
 
 if os.path.exists("sep.pyx"):
@@ -13,13 +15,19 @@ else:
     fname = "sep.c"
 
 sourcefiles = [fname] + glob(os.path.join("src", "*.c"))
+headerfiles = glob(os.path.join("src", "*.h"))
 include_dirs=[numpy.get_include(), "src"]
-extensions = [Extension("sep", sourcefiles, include_dirs=include_dirs)]
+extensions = [Extension("sep", sourcefiles, include_dirs=include_dirs,
+                        depends=headerfiles)]
 if USE_CYTHON:
     from Cython.Build import cythonize
     extensions = cythonize(extensions)
 
+# Synchronize version from code.
+version = re.findall(r"__version__ = \"(.*?)\"", open(fname).read())[0]
+
 description = "Astronomical source extraction and photometry library"
+long_description = "http://sep.readthedocs.org"
 
 classifiers = [
     "Development Status :: 5 - Production/Stable",
@@ -31,9 +39,9 @@ classifiers = [
     "Intended Audience :: Science/Research"]
 
 setup(name="sep", 
-      version="0.3.0",
+      version=version,
       description=description,
-      long_description=description,
+      long_description=long_description,
       license="LGPLv3+",
       classifiers=classifiers,
       url="https://github.com/kbarbary/sep",

@@ -25,6 +25,8 @@ IMAGECAT_FNAME = os.path.join("data", "image.cat")
 IMAGECAT_DTYPE = [('number', np.int64),
                   ('x', np.float64),
                   ('y', np.float64),
+                  ('xwin', np.float64),
+                  ('ywin', np.float64),
                   ('a', np.float64),
                   ('flux_aper', np.float64),
                   ('fluxerr_aper', np.float64),
@@ -57,6 +59,18 @@ if not NO_FITS:
 
 @pytest.mark.skipif(NO_FITS, reason="no FITS reader") 
 def test_vs_sextractor():
+    """Test behavior of sep versus sextractor.
+
+    Note: we turn deblending off for this test. This is because the
+    deblending algorithm uses a random number generator. Since the sequence
+    of random numbers is not the same between sextractor and sep or between
+    different platforms, object member pixels (and even the number of objects)
+    can differ when deblending is on.
+
+    Deblending is turned off by setting DEBLEND_MINCONT=1.0 in the sextractor
+    configuration file and by setting deblend_cont=1.0 in sep.extract().
+    """
+
     data = np.copy(image_data)  # make an explicit copy so we can 'subfrom'
     bkg = sep.Background(data, bw=64, bh=64, fw=3, fh=3)
 
@@ -64,9 +78,9 @@ def test_vs_sextractor():
     bkgarr = bkg.back(dtype=np.float32)
     assert_allclose(bkgarr, image_refback, rtol=1.e-5)
 
-    # Extract objects
+    # Extract objects (use deblend_cont=1.0 to disable deblending).
     bkg.subfrom(data)
-    objs = sep.extract(data, 1.5*bkg.globalrms)
+    objs = sep.extract(data, 1.5*bkg.globalrms, deblend_cont=1.0)
     objs = np.sort(objs, order=['y'])
 
     # Read SExtractor result
@@ -96,17 +110,20 @@ def test_vs_sextractor():
                                           objs['theta'], r=2.5 * kr,
                                           err=bkg.globalrms, subpix=1)
 
-    # For some reason, object at index 59 doesn't match. It's very small
+    # For some reason, one object doesn't match. It's very small
     # and kron_radius is set to 0.0 in SExtractor, but 0.08 in sep.
-    # Most of the other values are within 1e-4 except one which is only
-    # within 0.01. This might be due to a change in SExtractor between
-    # v2.8.6 (used to generate "truth" catalog) and v2.18.11.
-    kr[59] = 0.0
-    flux[59] = 0.0
-    fluxerr[59] = 0.0
-    assert_allclose(2.5*kr, refobjs['kron_radius'], rtol=0.01)
-    assert_allclose(flux, refobjs['flux_auto'], rtol=0.01)
-    assert_allclose(fluxerr, refobjs['fluxerr_auto'], rtol=0.01)
+    # Could be due to a change in SExtractor between v2.8.6 (used to
+    # generate "truth" catalog) and v2.18.11 (from which sep was forked).
+    i = 56  # index is 59 when deblending is on.
+    kr[i] = 0.0
+    flux[i] = 0.0
+    fluxerr[i] = 0.0
+
+    # We use atol for radius because it is reported to nearest 0.01 in
+    # reference objects.
+    assert_allclose(2.5*kr, refobjs['kron_radius'], atol=0.01, rtol=0.) 
+    assert_allclose(flux, refobjs['flux_auto'], rtol=0.0005)
+    assert_allclose(fluxerr, refobjs['fluxerr_auto'], rtol=0.0005)
 
     # Test ellipse representation conversion
     cxx, cyy, cxy = sep.ellipse_coeffs(objs['a'], objs['b'], objs['theta'])
@@ -131,6 +148,11 @@ def test_vs_sextractor():
                                 subpix=5)
     assert_allclose(fr, refobjs["flux_radius"], rtol=0.04, atol=0.01)
 
+    # test winpos
+    sig = 2. / 2.35 * fr[:, 1]  # flux_radius = 0.5
+    xwin, ywin, flag = sep.winpos(data, objs['x'], objs['y'], sig)
+    assert_allclose(xwin, refobjs["xwin"] - 1., rtol=0., atol=0.0025)
+    assert_allclose(ywin, refobjs["ywin"] - 1., rtol=0., atol=0.0025)
 
 # -----------------------------------------------------------------------------
 # Background
@@ -165,6 +187,30 @@ def test_masked_background():
     assert_allclose(sky.back(), 0.1 * np.ones((6, 6)))
 
 
+def test_background_special():
+    """Test special methods of Background"""
+
+    bkg = sep.Background(image_data, bw=64, bh=64, fw=3, fh=3)
+
+    # test __array__ method
+    assert np.all(np.array(bkg) == bkg.back())
+
+    # test __rsub__ method
+    d1 = image_data - bkg
+
+    d2 = np.copy(image_data)
+    bkg.subfrom(d2)
+    assert np.all(d1 == d2)
+
+
+def test_background_boxsize():
+    """Test that background works when boxsize is same as image"""
+
+    ny, nx = 100, 100
+    data = np.ones((ny, nx), dtype=np.float64)
+    bkg = sep.Background(data, bh=ny, bw=nx, fh=1, fw=1)
+    bkg.back()
+
 # -----------------------------------------------------------------------------
 # Extract
 
@@ -182,15 +228,93 @@ def test_extract_with_noise_array():
     # convolved. Near edges, the convolution doesn't adjust for pixels
     # off edge boundaries. As a result, the convolved noise map is not
     # all ones.
-    objects = sep.extract(data, 1.5*bkg.globalrms, conv=None)
+    objects = sep.extract(data, 1.5*bkg.globalrms, filter_kernel=None)
     objects2 = sep.extract(data, 1.5*bkg.globalrms, err=np.ones_like(data),
-                           conv=None)
+                           filter_kernel=None)
     assert_equal(objects, objects2)
 
     # Less trivial test where thresh is realistic. Still a flat noise map.
     noise = bkg.globalrms * np.ones_like(data)
-    objects2 = sep.extract(data, 1.5, err=noise, conv=None)
+    objects2 = sep.extract(data, 1.5, err=noise, filter_kernel=None)
     assert_equal(objects, objects2)
+
+def test_extract_with_noise_convolution():
+    """Test extraction when there is both noise and convolution.
+
+    This will use the matched filter implementation, and will handle bad pixels
+    and edge effects gracefully.
+    """
+
+    # Start with an empty image where we label the noise as 1 sigma everywhere.
+    image = np.zeros((20, 20))
+    error = np.ones((20, 20))
+
+    # Add some noise representing bad pixels. We do not want to detect these.
+    image[17, 3] = 100.
+    error[17, 3] = 100.
+    image[10, 0] = 100.
+    error[10, 0] = 100.
+    image[17, 17] = 100.
+    error[17, 17] = 100.
+
+    # Add some real point sources that we should find.
+    image[3, 17] = 10.
+
+    image[6, 6] = 2.0
+    image[7, 6] = 1.0
+    image[5, 6] = 1.0
+    image[6, 5] = 1.0
+    image[6, 7] = 1.0
+
+    objects = sep.extract(image, 2.0, minarea=1, err=error)
+    objects.sort(order=['x', 'y'])
+
+    # Check that we recovered the two correct objects and not the others.
+    assert len(objects) == 2
+
+    assert_approx_equal(objects[0]['x'], 6.)
+    assert_approx_equal(objects[0]['y'], 6.)
+
+    assert_approx_equal(objects[1]['x'], 17.)
+    assert_approx_equal(objects[1]['y'], 3.)
+
+
+@pytest.mark.skipif(NO_FITS, reason="no FITS reader") 
+def test_extract_with_mask():
+
+    # Get some background-subtracted test data:
+    data = np.copy(image_data)
+    bkg = sep.Background(data, bw=64, bh=64, fw=3, fh=3)
+    bkg.subfrom(data)
+
+    # mask half the image
+    ylim = data.shape[0] // 2
+    mask = np.zeros(data.shape, dtype=np.bool)
+    mask[ylim:,:] = True
+
+    objects = sep.extract(data, 1.5*bkg.globalrms, mask=mask)
+    
+    # check that we found some objects and that they are all in the unmasked
+    # region.
+    assert len(objects) > 0
+    assert np.all(objects['y'] < ylim)
+
+
+@pytest.mark.skipif(NO_FITS, reason="no FITS reader") 
+def test_extract_segmentation_map():
+
+    # Get some background-subtracted test data:
+    data = np.copy(image_data)
+    bkg = sep.Background(data, bw=64, bh=64, fw=3, fh=3)
+    bkg.subfrom(data)
+
+    objects, segmap = sep.extract(data, 1.5*bkg.globalrms,
+                                  segmentation_map=True)
+
+    assert type(segmap) is np.ndarray
+    assert segmap.shape == data.shape
+    for i in range(len(objects)):
+        assert objects["npix"][i] == (segmap == i+1).sum()
 
 
 # -----------------------------------------------------------------------------
@@ -302,9 +426,16 @@ def test_aperture_bkgann_ones():
     bkgann=(6., 8.)
 
     # On flat data, result should be zero for any bkgann and subpix
-    f, _, _ = sep.sum_circle(data, x, y, r, bkgann=bkgann)
+    f, fe, _ = sep.sum_circle(data, x, y, r, bkgann=bkgann, gain=1.)
     assert_allclose(f, 0., rtol=0., atol=1.e-13)
-   
+
+    # for all ones data and no error array, error should be close to
+    # sqrt(Npix_aper + Npix_ann * (Npix_aper**2 / Npix_ann**2))
+    aper_area = np.pi * r**2
+    bkg_area = np.pi * (bkgann[1]**2 - bkgann[0]**2)
+    expected_error = np.sqrt(aper_area + bkg_area * (aper_area/bkg_area)**2)
+    assert_allclose(fe, expected_error, rtol=0.1)
+
     f, _, _ = sep.sum_ellipse(data, x, y, 2., 1., np.pi/4., r, bkgann=bkgann)
     assert_allclose(f, 0., rtol=0., atol=1.e-13)
 
@@ -356,7 +487,7 @@ def test_byte_order_exception():
     data = data.byteswap(True).newbyteorder()
     with pytest.raises(ValueError) as excinfo:
         bkg = sep.Background(data)
-    assert 'byte order' in str(excinfo.value)
+    assert 'byte order' in excinfo.value.args[0]
 
 
 def test_set_pixstack():
@@ -365,4 +496,24 @@ def test_set_pixstack():
     new = old * 2
     sep.set_extract_pixstack(new)
     assert new == sep.get_extract_pixstack()
+    sep.set_extract_pixstack(old)
+
+
+def test_long_error_msg():
+    """Ensure that the error message is created successfully when
+    there is an error detail."""
+
+    # set extract pixstack to an insanely small value; this will trigger
+    # a detailed error message when running sep.extract()
+    old = sep.get_extract_pixstack()
+    sep.set_extract_pixstack(5)
+
+    data = np.ones((10, 10), dtype=np.float64)
+    with pytest.raises(Exception) as excinfo:
+        sep.extract(data, 0.1)
+    msg = excinfo.value.args[0]
+    assert type(msg) == str  # check that message is the native string type
+    assert msg.startswith("internal pixel buffer full: The limit")
+
+    # restore
     sep.set_extract_pixstack(old)
